@@ -5,8 +5,8 @@ Author: Arushi
 """
 
 import math
-from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize
+from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea, QLineEdit, QToolTip
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize, Signal
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon, QPixmap
 from osdagbridge.core.utils.common import *
 from osdagbridge.desktop.cad.irc5_geometry import (
@@ -18,6 +18,9 @@ from osdagbridge.desktop.cad.irc5_geometry import (
 
 class CrossSectionCADWidget(QWidget):
     """Widget for drawing bridge cross-section view"""
+    # Emitted in input-dictionary units: metres for widths/spacing and mm for
+    # deck thickness. The parent owns validation and persistence.
+    parameter_edited = Signal(str, object)
     # ===== SHARED CAD COLORS =====
     GIRDER_COLOR = QColor(179, 180, 160) 
     STIFFENER_COLOR = QColor(210, 210, 205)
@@ -46,6 +49,9 @@ class CrossSectionCADWidget(QWidget):
         self.median_type = None
         # hover label regions: list of (QRectF, text, bg_color, text_color)
         self.hover_labels = []
+        # (hit rectangle, central input key, value in input units)
+        self.editable_regions = []
+        self._inline_editor = None
         self.hovered_label_index = -1
         self.hovered_element = None  # Track hovered element for highlighting
         self.cross_section_hover_zones = []  # Store hover zones as (QRectF, element_type)
@@ -708,17 +714,75 @@ class CrossSectionCADWidget(QWidget):
         if new_hovered != self.hovered_label_index:
             self.hovered_label_index = new_hovered
             self.update()
-        
+
         # Check element hover
         new_hovered_element = None
         for rect, element_type in self.cross_section_hover_zones:
             if rect.contains(pos):
                 new_hovered_element = element_type
                 break
-        
+
         if new_hovered_element != self.hovered_element:
             self.hovered_element = new_hovered_element
             self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        """Open an inline editor only for write-enabled dimension labels."""
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        for rect, key, value in reversed(self.editable_regions):
+            if rect.contains(pos):
+                self._begin_inline_edit(rect, key, value)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def _begin_inline_edit(self, rect, key, value):
+        if self._inline_editor is not None:
+            self._commit_inline_edit()
+        editor = QLineEdit(self)
+        editor.setText(f"{float(value):g}")
+        editor.setPlaceholderText("Enter value")
+        editor.setAlignment(Qt.AlignCenter)
+        editor.setFont(QFont("Arial", 11, QFont.Normal))
+        editor.setStyleSheet(
+            "QLineEdit { background: #ffffff; color: #222222; "
+            "border: 2px solid #90AF13; border-radius: 4px; "
+            "padding: 3px 8px; selection-background-color: #90AF13; "
+            "selection-color: #ffffff; }"
+        )
+        editor.setMinimumSize(120, 30)
+        editor.adjustSize()
+        editor.resize(max(120, rect.width() + 24), 30)
+        center = rect.center()
+        editor.move(int(center.x() - editor.width() / 2),
+                    int(center.y() - editor.height() / 2))
+        editor.setProperty("cad_parameter_key", key)
+        editor.setProperty("cad_original_value", value)
+        editor.editingFinished.connect(self._commit_inline_edit)
+        self._inline_editor = editor
+        editor.show()
+        editor.raise_()
+        editor.selectAll()
+        editor.setFocus()
+
+    def _commit_inline_edit(self):
+        editor = self._inline_editor
+        if editor is None:
+            return
+        text = editor.text().strip()
+        key = editor.property("cad_parameter_key")
+        try:
+            value = float(text)
+            if value <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            QToolTip.showText(editor.mapToGlobal(QPointF(0, editor.height()).toPoint()), "Enter a positive number")
+            editor.setFocus()
+            editor.selectAll()
+            return
+        editor.deleteLater()
+        self._inline_editor = None
+        self.parameter_edited.emit(str(key), value)
 
         
     def paintEvent(self, event):
@@ -728,6 +792,7 @@ class CrossSectionCADWidget(QWidget):
             self._buttons_positioned = True
         # clear hover labels and zones at start of each paint
         self.hover_labels = []
+        self.editable_regions = []
         self.cross_section_hover_zones = []
         
         painter = QPainter(self)
@@ -779,7 +844,7 @@ class CrossSectionCADWidget(QWidget):
             painter.drawText(int(x), int(first_line_y + i * line_height), line)
 
     
-    def draw_dimension_arrow(self, painter, x1, y1, x2, y2, text, horizontal=True, offset=0, text_offset=0, draw_extensions=True, extension_direction='down', extension_end_y=None):
+    def draw_dimension_arrow(self, painter, x1, y1, x2, y2, text, horizontal=True, offset=0, text_offset=0, draw_extensions=True, extension_direction='down', extension_end_y=None, editable_key=None):
         """dimension line with arrows and text with extension lines"""
         painter.setPen(QPen(QColor(0, 0, 0), 0.8))
         
@@ -848,6 +913,17 @@ class CrossSectionCADWidget(QWidget):
             
             self.draw_text_with_background(painter, text_x - text_width/2, text_y, text, 
                                         QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False)
+            if editable_key is not None:
+                raw_value = {
+                    KEY_CARRIAGEWAY_WIDTH: self.params.get('carriageway_width', 0) / 1000.0,
+                    KEY_TS_GIRDER_SPACING: self.params.get('girder_spacing', 0) / 1000.0,
+                }.get(editable_key)
+                if raw_value is not None:
+                    self.editable_regions.append((
+                        QRectF(text_x - 4, text_y - metrics.height() - 3,
+                               text_width + 8, metrics.height() + 6),
+                        editable_key, raw_value
+                    ))
         else:
             top_arrow = [
                 QPointF(x1, y1),
@@ -2122,7 +2198,7 @@ class CrossSectionCADWidget(QWidget):
                 label_cw += f" = {cw_m:.2f} m"
             
             self.draw_dimension_arrow(painter, actual_cw_start, Y_TOP_COMMON, median_start_x, Y_TOP_COMMON,
-                                    label_cw, True, 
+                                    label_cw, True, editable_key=KEY_CARRIAGEWAY_WIDTH,
                                     extension_direction='down',
                                     extension_end_y=deck_top_y)
             
@@ -2139,7 +2215,7 @@ class CrossSectionCADWidget(QWidget):
             
             # Right carriageway - ends exactly at right barrier visual start
             self.draw_dimension_arrow(painter, median_end_x, Y_TOP_COMMON, actual_cw_end, Y_TOP_COMMON,
-                                    label_cw, True, 
+                                    label_cw, True, editable_key=KEY_CARRIAGEWAY_WIDTH,
                                     extension_direction='down',
                                     extension_end_y=deck_top_y)
         else:
@@ -2151,7 +2227,7 @@ class CrossSectionCADWidget(QWidget):
                 label_cw += f" = {cw_m:.2f} m"
             
             self.draw_dimension_arrow(painter, actual_cw_start, Y_TOP_COMMON, actual_cw_end, Y_TOP_COMMON,
-                                    label_cw, True, 
+                                    label_cw, True, editable_key=KEY_CARRIAGEWAY_WIDTH,
                                     extension_direction='down',
                                     extension_end_y=deck_top_y)
         
@@ -2206,7 +2282,7 @@ class CrossSectionCADWidget(QWidget):
                 label_gs += f" = {gs_m:.2f} m"
                 
             self.draw_dimension_arrow(painter, x_left, Y_GIRDER_SPACING, x_right, Y_GIRDER_SPACING,
-                                    label_gs, True, 
+                                    label_gs, True, editable_key=KEY_TS_GIRDER_SPACING,
                                     extension_direction='up',
                                     extension_end_y=base_y)
         
@@ -2287,6 +2363,9 @@ class CrossSectionCADWidget(QWidget):
             
             self.draw_text_with_background(painter, text_x, text_y, text,
                                         QColor(255, 255, 255, 255), QColor(0, 0, 0), 9, False)
+            self.editable_regions.append((QRectF(text_x - 4, text_y - metrics.height() - 3,
+                                                   text_width + 8, metrics.height() + 6),
+                                           KEY_TS_DECK_THICKNESS, deck_t_mm))
     def add_cross_section_hover_labels(self, painter, carriageway_start_x, carriageway_end_x,
                     left_barrier_x, right_barrier_x, deck_top_y, deck_bottom_y,
                     deck_thick_px, positions, base_y, scale, n, fp_config,

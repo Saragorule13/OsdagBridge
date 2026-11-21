@@ -5,8 +5,8 @@ Author: Arushi
 """
 from osdagbridge.core.utils.common import *
 import math
-from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea
-from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize
+from PySide6.QtWidgets import QWidget, QPushButton, QScrollArea, QLineEdit, QToolTip
+from PySide6.QtCore import Qt, QRectF, QPointF, QTimer, QSize, Signal
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPolygonF, QIcon
 from .cad_cross_section import CrossSectionCADWidget
 
@@ -27,6 +27,7 @@ LEADER_TEXT_OFFSET = 25    # leader label distance
 
 class TopViewCADWidget(QWidget):
     """Widget for drawing bridge top view"""
+    parameter_edited = Signal(str, object)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -37,6 +38,8 @@ class TopViewCADWidget(QWidget):
         
         # top view hover tracking 
         self.top_view_hover_zones = []  # list of (QRectF, element_type)
+        self.editable_regions = []      # (hit rectangle, central input key, value)
+        self._inline_editor = None
         self.hovered_top_view_element = None
         
         # Zoom level for this widget
@@ -477,7 +480,63 @@ class TopViewCADWidget(QWidget):
             self.hovered_top_view_element = new_hovered
             self.update()
 
+    def mouseDoubleClickEvent(self, event):
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        for rect, key, value in reversed(self.editable_regions):
+            if rect.contains(pos):
+                self._begin_inline_edit(rect, key, value)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def _begin_inline_edit(self, rect, key, value):
+        if self._inline_editor is not None:
+            self._commit_inline_edit()
+        editor = QLineEdit(self)
+        editor.setText(f"{float(value):g}")
+        editor.setPlaceholderText("Enter value")
+        editor.setAlignment(Qt.AlignCenter)
+        editor.setFont(QFont("Arial", 11, QFont.Normal))
+        editor.setStyleSheet(
+            "QLineEdit { background: #ffffff; color: #222222; "
+            "border: 2px solid #90AF13; border-radius: 4px; "
+            "padding: 3px 8px; selection-background-color: #90AF13; "
+            "selection-color: #ffffff; }"
+        )
+        editor.setMinimumSize(120, 30)
+        editor.adjustSize()
+        editor.resize(max(120, rect.width() + 24), 30)
+        center = rect.center()
+        editor.move(int(center.x() - editor.width() / 2),
+                    int(center.y() - editor.height() / 2))
+        editor.setProperty("cad_parameter_key", key)
+        editor.editingFinished.connect(self._commit_inline_edit)
+        self._inline_editor = editor
+        editor.show()
+        editor.raise_()
+        editor.selectAll()
+        editor.setFocus()
+
+    def _commit_inline_edit(self):
+        editor = self._inline_editor
+        if editor is None:
+            return
+        try:
+            value = float(editor.text().strip())
+            if value <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            QToolTip.showText(editor.mapToGlobal(QPointF(0, editor.height()).toPoint()), "Enter a positive number")
+            editor.setFocus()
+            editor.selectAll()
+            return
+        key = editor.property("cad_parameter_key")
+        editor.deleteLater()
+        self._inline_editor = None
+        self.parameter_edited.emit(str(key), value)
+
     def paintEvent(self, event):
+        self.editable_regions = []
         # clear hover zones at start of each paint
         self.top_view_hover_zones = []
         
@@ -1301,6 +1360,14 @@ class TopViewCADWidget(QWidget):
             painter, x1_span, dim_y2, x2_span, dim_y2,
             label_span, last_girder_y
         )
+        metrics = painter.fontMetrics()
+        span_width = metrics.boundingRect(label_span).width()
+        self.editable_regions.append((
+            QRectF((x1_span + x2_span) / 2 - span_width / 2 - 6,
+                   dim_y2 - metrics.height() - 8,
+                   span_width + 12, metrics.height() + 14),
+            KEY_SPAN, span_m
+        ))
 
         # GIRDER SPACING dimension (always visible)
         if n > 1:
@@ -1336,6 +1403,13 @@ class TopViewCADWidget(QWidget):
                 QColor(255, 255, 255, 240),
                 QColor(0, 0, 0), 9, False
             )
+            metrics = painter.fontMetrics()
+            self.editable_regions.append((
+                QRectF(label_x - 5, label_y - metrics.height() - 4,
+                       max(metrics.boundingRect(line).width() for line in label_text.split("\n")) + 12,
+                       metrics.height() * 3 + 8),
+                KEY_TS_GIRDER_SPACING, gs_m
+            ))
 
         # CL OF BEARING labels - ALWAYS VISIBLE (moved outside hover condition)
         label_y_bearing = top_extent - 8

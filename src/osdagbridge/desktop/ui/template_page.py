@@ -347,6 +347,7 @@ class CustomWindow(QWidget):
 
         # CAD widget
         self.cad_comp_widget = BridgeDualCADWidget(self)
+        self.cad_comp_widget.parameter_edited.connect(self._on_cad_parameter_edited)
         self.cad_comp_widget.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding
         )
@@ -418,6 +419,32 @@ class CustomWindow(QWidget):
 
         # Update tool bar visibility based on view rules
         self._update_tool_bar_visibility()
+
+    def _on_cad_parameter_edited(self, key: str, value: object) -> None:
+        """Persist a value edited on a 2D CAD dimension label.
+
+        Basic fields are pushed through InputDock so its normal validation and
+        change notification remain active. Additional-input values are written
+        to the shared dictionaries and then the normal CAD mapping redraws both
+        views.
+        """
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return
+
+        widget = self.input_dock._w(key) if self.input_dock else None
+        if isinstance(widget, QLineEdit):
+            widget.blockSignals(True)
+            widget.setText(f"{numeric_value:g}")
+            widget.blockSignals(False)
+            self.input_dock._on_field_edited(key, widget)
+        else:
+            self.input_dict[key] = numeric_value
+            if self._additional_inputs_dialog is not None:
+                self._additional_inputs_dialog.working_input_dict[key] = numeric_value
+                self._additional_inputs_dialog.default_input_dict[key] = numeric_value
+            self.update_cad_from_inputs()
 
     #-------View-Rules-of-Tool-bar-START----------------------------------------
 
