@@ -863,7 +863,8 @@ class OutputDock(QWidget):
         if combo_analysis is not None:
             combo_analysis.blockSignals(True)
             combo_analysis.clear()
-            combo_analysis.addItems(["All"] + items)
+            from osdagbridge.core.bridge_types.plate_girder.results_data import TRANSVERSE_MEMBER_LABEL
+            combo_analysis.addItems(["All", TRANSVERSE_MEMBER_LABEL] + items)
             combo_analysis.setCurrentIndex(0)
             combo_analysis.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo_analysis.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)

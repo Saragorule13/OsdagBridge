@@ -80,6 +80,9 @@ class LazyLoadcaseResults(Mapping):
 
 _TOOLS_DIR = Path(__file__).resolve().parents[5] / "tools"
 
+# Shared display label used by the plot member selector and plot generator.
+TRANSVERSE_MEMBER_LABEL = "Transverse Members"
+
 
 def _build_nodes_members() -> tuple[dict, dict]:
     """Read node coords and element connectivity from the live openseespy model."""
@@ -92,6 +95,36 @@ def _build_nodes_members() -> tuple[dict, dict]:
         for e in ops.getEleTags()
     }
     return nodes, members
+
+
+def build_nodes_members() -> tuple[dict, dict]:
+    """Public node/element extraction entry point for plotting consumers."""
+    return _build_nodes_members()
+
+
+def classify_member_tags(nodes: dict, members: dict, tol: float = 1e-3) -> tuple[list, list]:
+    """Classify element tags using the live model's node coordinates.
+
+    Longitudinal elements keep both their Y and Z coordinates constant between
+    end nodes. The remaining grillage beam elements are transverse members
+    (end diaphragms, intermediate transverse members, and cross-bracing).
+    Keeping this classification in ``results_data`` makes plotting use the same
+    node/element interpretation as result extraction and JSON exports.
+    """
+    longitudinal = []
+    transverse = []
+    for tag, endpoints in members.items():
+        if len(endpoints) != 2:
+            continue
+        n1, n2 = endpoints
+        if n1 not in nodes or n2 not in nodes:
+            continue
+        if (abs(nodes[n1][2] - nodes[n2][2]) < tol and
+                abs(nodes[n1][1] - nodes[n2][1]) < tol):
+            longitudinal.append(tag)
+        else:
+            transverse.append(tag)
+    return longitudinal, transverse
 
 
 def dump_full_data(
@@ -408,18 +441,9 @@ def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = F
     disp_components = [str(
         c) for c in ds0["displacements"].coords["Component"].values] if "displacements" in ds0.data_vars else []
 
-    # Classify members: longitudinal = both nodes share same Z and same Y
-    _z_tol = 1e-3
-    longitudinal_members = []
-    transverse_members = []
-    for tag, (n1, n2) in members.items():
-        if n1 not in nodes or n2 not in nodes:
-            continue
-        if (abs(nodes[n1][2] - nodes[n2][2]) < _z_tol and
-                abs(nodes[n1][1] - nodes[n2][1]) < _z_tol):
-            longitudinal_members.append(tag)
-        else:
-            transverse_members.append(tag)
+    # Classify members through the shared results-data helper so plots and
+    # exported result dictionaries use identical element groups.
+    longitudinal_members, transverse_members = classify_member_tags(nodes, members)
 
     data: dict = {
         "nodes": {str(k): list(v) for k, v in nodes.items()},

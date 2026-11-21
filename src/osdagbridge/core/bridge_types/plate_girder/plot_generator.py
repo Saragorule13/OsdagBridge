@@ -18,6 +18,11 @@ try:
 except ImportError:
     _MPLCURSORS = False
 
+from osdagbridge.core.bridge_types.plate_girder.results_data import (
+    classify_member_tags,
+    TRANSVERSE_MEMBER_LABEL,
+)
+
 # Force component map
 FORCE_MAP = {
     "Fx": ("Vx_i", "Vx_j"),
@@ -157,6 +162,106 @@ def _build_polyline(elems, members, nodes, force_i, force_j, ds):
     node_ids.append(n2)
 
     return np.array(xs), np.array(ys), np.array(zs), np.array(vals), node_ids
+
+
+def _find_component(ds, requested: str):
+    """Find a result component without depending on xarray string casing."""
+    available = ds["Component"].values if "Component" in ds.coords else []
+    for component in available:
+        if str(component).lower() == str(requested).lower():
+            return component
+    return None
+
+
+def _build_transverse_diagram(ds, value_key, nodes, members, eng_scale=1.0,
+                              is_displacement=False):
+    """Build one diagram for all transverse elements.
+
+    Each transverse element is drawn independently because diaphragms and
+    cross-bracing are not one continuous chain. They share one logical UI
+    selection and one summary entry, while retaining their individual element
+    endpoint values from the selected load case.
+    """
+    v_scale = _value_plot_scale(eng_scale)
+    _, transverse = classify_member_tags(nodes, members)
+    fig = Figure(figsize=(14, 6), dpi=110, facecolor="white")
+    ax = fig.add_subplot(111, projection="3d", facecolor="white")
+
+    if not nodes or not transverse:
+        ax.set_title(f"{value_key} Diagram — {TRANSVERSE_MEMBER_LABEL}", fontsize=12, fontweight="bold")
+        return fig, {}
+
+    all_xs = [coord[0] for coord in nodes.values()]
+    all_zs = [coord[2] for coord in nodes.values()]
+    x_range = max(all_xs) - min(all_xs) or 1.0
+    z_range = max(all_zs) - min(all_zs) or 1.0
+    ax.set_xlim(min(all_xs), max(all_xs))
+    ax.set_ylim(min(all_zs), max(all_zs))
+    ax.set_box_aspect([x_range, z_range, max(x_range * 0.30, 1e-6)])
+
+    if is_displacement:
+        component = DISP_MAP[value_key]
+        target_component = _find_component(ds["displacements"], component)
+        data_array = ds.get("displacements")
+        conversion = 1000.0
+        value_unit = "mm"
+        color = "#6A1B9A"
+    else:
+        comp_i, comp_j = FORCE_MAP[value_key]
+        target_component = None
+        data_array = ds.get("forces")
+        conversion = 1000.0
+        value_unit = "kNm" if value_key.startswith("M") else "kN"
+        color = "#1565C0" if value_key.startswith("F") else "#D84315"
+
+    if data_array is None:
+        return fig, {}
+
+    def result_value(node_or_element, component):
+        if component is None:
+            return 0.0
+        dimension = "Node" if is_displacement else "Element"
+        try:
+            return float(data_array.sel({dimension: node_or_element, "Component": component}).values) / conversion
+        except Exception:
+            return 0.0
+
+    values = []
+    for element in transverse:
+        n1, n2 = members[element]
+        x1, _, z1 = nodes[n1]
+        x2, _, z2 = nodes[n2]
+        if is_displacement:
+            v1 = result_value(n1, target_component)
+            v2 = result_value(n2, target_component)
+        else:
+            v1 = result_value(element, _find_component(data_array, comp_i))
+            v2 = result_value(element, _find_component(data_array, comp_j))
+        values.extend((v1, v2))
+        scaled = np.array((v1, v2)) * v_scale
+        ax.plot([x1, x2], [z1, z2], scaled, color=color, linewidth=2.2, zorder=5)
+        ax.plot([x1, x1], [z1, z1], [0.0, scaled[0]], color=color, linewidth=0.9, alpha=0.6)
+        ax.plot([x2, x2], [z2, z2], [0.0, scaled[1]], color=color, linewidth=0.9, alpha=0.6)
+        ax.scatter([x1, x2], [z1, z2], scaled, color=color, s=22, depthshade=False, zorder=6)
+
+    _add_grillage_background(ax, nodes, members, show_transverse=True,
+                             include_edge_longitudinals=True, include_end_transverse=True)
+    _add_supports(ax, nodes, members, edge_dist=0.0, selected_girder="All")
+    _add_node_number_labels(ax, nodes)
+    _add_element_number_labels(ax, nodes, members)
+
+    ax.set_xlabel("Span Length (m)", fontsize=10)
+    ax.set_ylabel("Bridge Width (m)", fontsize=10)
+    ax.set_zlabel(f"{FORCE_DISPLAY.get(value_key, DISP_DISPLAY.get(value_key, value_key))} ({value_unit})", fontsize=10)
+    ax.set_title(f"{value_key} Diagram — {TRANSVERSE_MEMBER_LABEL}", fontsize=12, fontweight="bold", pad=12)
+    _set_value_axis_tick_formatter(ax, v_scale)
+    zmin = min(0.0, min(values) * v_scale if values else 0.0)
+    zmax = max(0.0, max(values) * v_scale if values else 0.0)
+    pad = max(1e-6, 0.05 * max(zmax - zmin, 1e-9))
+    ax.set_zlim(zmin - pad, zmax + pad)
+    ax.view_init(elev=DEFAULT_ELEV, azim=DEFAULT_AZIM)
+    fig._eng_scale = v_scale
+    return fig, {TRANSVERSE_MEMBER_LABEL: {"max": max(values), "min": min(values)}}
 
 
 # =============================================================================
@@ -654,6 +759,12 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     """
     Build a 3-D matplotlib figure showing the Shear Force Diagram.
     """
+    if selected_girder == TRANSVERSE_MEMBER_LABEL:
+        return _build_transverse_diagram(
+            ds, force_key, nodes, members, eng_scale=eng_scale,
+            is_displacement=False,
+        )
+
     v_scale = _value_plot_scale(eng_scale)
     comp_i_name, comp_j_name = FORCE_MAP[force_key]
     disp_key = FORCE_DISPLAY.get(force_key, force_key)
@@ -917,6 +1028,12 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     fig          : matplotlib.figure.Figure
     summary_data : dict  — {girder_name: {"max": float, "min": float}}
     """
+    if selected_girder == TRANSVERSE_MEMBER_LABEL:
+        return _build_transverse_diagram(
+            ds, force_key, nodes, members, eng_scale=eng_scale,
+            is_displacement=False,
+        )
+
     v_scale = _value_plot_scale(eng_scale)
     comp_i_name, comp_j_name = FORCE_MAP[force_key]
     disp_key = FORCE_DISPLAY.get(force_key, force_key)
@@ -1291,6 +1408,12 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
     """
     Build a 3-D matplotlib figure showing the Deflection Diagram.
     """
+    if selected_girder == TRANSVERSE_MEMBER_LABEL:
+        return _build_transverse_diagram(
+            ds, disp_key, nodes, members, eng_scale=eng_scale,
+            is_displacement=True,
+        )
+
     v_scale = _value_plot_scale(eng_scale)
     comp_name  = DISP_MAP[disp_key]
     disp_label = DISP_DISPLAY.get(disp_key, disp_key)

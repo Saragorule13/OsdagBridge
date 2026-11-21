@@ -34,6 +34,7 @@ from .plot_generator import (
     build_nodes_members,
     figure_to_bytes,
 )
+from .results_data import build_nodes_members as build_result_nodes_members
 from osdagbridge.core.utils.codes.irc6_2017 import IRC6_2017
 from osdagbridge.core.utils.common import (
     KEY_STRUCTURE_TYPE,
@@ -3907,8 +3908,8 @@ class PlateGirderBridge:
         }
 
     def get_nodes_members(self) -> tuple[dict, dict]:
-        """Return (nodes, members) dicts built from the active openseespy model."""
-        return build_nodes_members()
+        """Return node coordinates and element connectivity via results_data."""
+        return build_result_nodes_members()
 
     def get_edge_dist(self) -> float:
         """Return the deck overhang distance (0.0 when no overhang)."""

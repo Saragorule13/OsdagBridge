@@ -48,6 +48,9 @@ class AdditionalInputs(QDialog):
         self.default_input_dict = {}
         # Work temporarily on a copy of default dictionary
         self.working_input_dict = {}
+        # Changes are staged in working_input_dict until Save is clicked.
+        self.is_modified = False
+        self._suppress_modified = False
         # Last confirmed-good spacing and girder count; restored if solver raises an error
         self._last_good_layout: dict = {}
 
@@ -176,6 +179,7 @@ class AdditionalInputs(QDialog):
         self._enforce_decimal_places(2)
         # Normalize existing numeric text to 2 decimal places for consistent display
         self._normalize_numeric_texts(2)
+        self._connect_modified_signals()
 
         # self._print_widget_tree()
 
@@ -192,6 +196,122 @@ class AdditionalInputs(QDialog):
                 self._print_widget_tree(child, indent + 1)
 
     # ── Dialog Lifecycle ─────────────────────────────────────────────────────────
+
+    def _connect_modified_signals(self) -> None:
+        """Track user changes without changing the existing field callbacks."""
+        for widget in self.findChildren(QLineEdit):
+            widget.textChanged.connect(self._mark_modified)
+        for widget in self.findChildren(QComboBox):
+            widget.currentTextChanged.connect(self._mark_modified)
+        for widget in self.findChildren(QCheckBox):
+            widget.stateChanged.connect(self._mark_modified)
+
+    def _mark_modified(self, *_args) -> None:
+        if not self._suppress_modified:
+            self.is_modified = True
+
+    def _field_labels_from_schema(self) -> dict[str, str]:
+        """Return central-key-to-label mappings from ADDITIONAL_INPUTS_SCHEMA."""
+        labels: dict[str, str] = {}
+
+        def visit(node):
+            if isinstance(node, dict):
+                field_id = node.get("id")
+                label = node.get("label")
+                if field_id and label:
+                    labels[str(field_id)] = str(label).replace("<sub>", "").replace("</sub>", "")
+                for value in node.values():
+                    visit(value)
+            elif isinstance(node, (list, tuple)):
+                for value in node:
+                    visit(value)
+
+        visit(ADDITIONAL_INPUTS_SCHEMA)
+        return labels
+
+    def _custom_value_widget(self, container, base_key):
+        """Find the value control paired with a central-key mode control."""
+        value_name = f"{base_key}.value"
+        value_widget = container.findChild(QLineEdit, value_name)
+        if value_widget is not None:
+            return value_widget
+        return container.findChild(QComboBox, value_name)
+
+    def _custom_field_label(self, base_key, labels):
+        return labels.get(base_key, base_key)
+
+    def _validate_custom_inputs(self) -> bool:
+        """Reject every active Custom mode whose paired value is empty."""
+        labels = self._field_labels_from_schema()
+
+        for tab_index in range(self.tabs.count()):
+            if not self.tabs.isTabEnabled(tab_index):
+                continue
+            tab = self.tabs.widget(tab_index)
+
+            # TYPE_MODE_LINE / TYPE_MODE_VALUE controls use <central-key>.mode
+            # and <central-key>.value object names.
+            for mode_widget in tab.findChildren(QComboBox):
+                mode_name = mode_widget.objectName()
+                if not mode_name.endswith(".mode"):
+                    continue
+                if mode_widget.currentText().strip().lower() != "custom":
+                    continue
+                base_key = mode_name[:-len(".mode")]
+                value_widget = self._custom_value_widget(tab, base_key)
+                if value_widget is None:
+                    continue
+                value = value_widget.text() if isinstance(value_widget, QLineEdit) else value_widget.currentText()
+                if not str(value or "").strip():
+                    label = self._custom_field_label(base_key, labels)
+                    self._show_custom_value_error(label)
+                    value_widget.setFocus()
+                    return False
+
+            # TYPE_ADAPTIVE controls switch a field to its Custom page based
+            # on the central design-mode key. Validate the visible input page.
+            for adaptive in tab.findChildren(AdaptiveWidget):
+                controller_id = getattr(adaptive, "_controller_id", "")
+                mode = str(self.working_input_dict.get(controller_id) or "").strip().lower()
+                if mode != "custom":
+                    continue
+                value_widget = adaptive.currentWidget()
+                if not isinstance(value_widget, QLineEdit):
+                    continue
+                if not value_widget.text().strip():
+                    field_key = adaptive.objectName()
+                    label = self._custom_field_label(field_key, labels)
+                    self._show_custom_value_error(label)
+                    value_widget.setFocus()
+                    return False
+
+        return True
+
+    def _show_custom_value_error(self, label: str) -> None:
+        CustomMessageBox(
+            title="Error",
+            text=f"Error: The custom value for '{label}' cannot be empty.",
+            buttons=["OK"],
+            dialogType=MessageBoxType.Warning,
+        ).exec()
+
+    def closeEvent(self, event):
+        """Protect staged edits when the dialog is closed without saving."""
+        if not self.is_modified:
+            event.accept()
+            return
+
+        result = CustomMessageBox(
+            title="Unsaved Changes",
+            text="You have unsaved changes. Closing this window will discard them. Do you want to proceed?",
+            buttons=["Discard", "Cancel"],
+            dialogType=MessageBoxType.Warning,
+        ).exec()
+        if result == "Discard":
+            self.is_modified = False
+            event.accept()
+        else:
+            event.ignore()
 
     def lock(self, lock: bool = True):  # enables or disables all input widgets inside the tab area; action buttons (save/defaults) are unaffected
         self._locked = lock
@@ -229,6 +349,7 @@ class AdditionalInputs(QDialog):
         return super().eventFilter(obj, event)
 
     def set_input_dictionary(self, input_dict: dict):  # lifecycle: sets default/working dicts and wires END_CONNECTORS on first open
+        self._suppress_modified = True
         self.default_input_dict = input_dict
         self.working_input_dict = deepcopy(input_dict)
 
@@ -245,6 +366,8 @@ class AdditionalInputs(QDialog):
             self.interacted_first = False
             from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import END_CONNECTORS
             UIBuilder.wire_end_connectors(END_CONNECTORS, ai=self)
+        self.is_modified = False
+        self._suppress_modified = False
 
     def set_defaults(self) -> None:  # lifecycle: populates all widgets from working_input_dict; called at init time only
         """
@@ -453,6 +576,8 @@ class AdditionalInputs(QDialog):
         if active_tab is None:
             return
 
+        self._mark_modified()
+
         if hasattr(active_tab, "reset_active_tab_defaults"):
             active_tab.reset_active_tab_defaults()
             return
@@ -508,6 +633,9 @@ class AdditionalInputs(QDialog):
 
     def _save_inputs(self):  # on_change: validates all tabs then commits working_input_dict and emits CAD update signal
 
+        if not self._validate_custom_inputs():
+            return
+
         # Flush the currently-displayed stiffener member's widgets before committing.
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
         # member (via _on_stiffener_member_load), so the last-viewed girder (e.g. G4)
@@ -517,6 +645,7 @@ class AdditionalInputs(QDialog):
             self._save_stiffener_member_data(combo.currentText().strip())
 
         self.default_input_dict.update(self.working_input_dict)
+        self.is_modified = False
         from osdagbridge.desktop.ui.docks.cad_cross_section import CrossSectionCADWidget
         cad = self.findChild(CrossSectionCADWidget, KEY_TS_CAD_PREVIEW)
         if cad:
